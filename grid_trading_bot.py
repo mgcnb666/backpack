@@ -192,33 +192,27 @@ class MartingaleBot:
         """取消指定ID的订单"""
         try:
             logger.info(f"正在取消订单: {order_id}")
-            # 使用重试机制取消订单
             max_retries = 3
             retry_delay = 1  # 初始延迟1秒
             
             for attempt in range(max_retries):
                 try:
                     response = await self.bpx.orderCancel(self.symbol, order_id)
-                    
-                    # 验证响应
                     if response:
                         logger.info(f"订单 {order_id} 取消成功: {response}")
                         return True
                     else:
                         logger.warning(f"订单 {order_id} 取消请求没有返回响应")
-                        
-                    # 如果成功，直接返回
-                    break
+                    break  # 如果成功，直接退出循环
                 except Exception as e:
                     if "Order not found" in str(e):
                         logger.info(f"订单 {order_id} 不存在或已完成，无需取消")
                         return True
-                    elif attempt < max_retries - 1:  # 如果不是最后一次尝试
-                        wait_time = retry_delay * (2 ** attempt)  # 指数退避策略
+                    elif attempt < max_retries - 1:
+                        wait_time = retry_delay * (2 ** attempt)
                         logger.warning(f"取消订单 {order_id} 失败 (尝试 {attempt+1}/{max_retries}): {e}. 将在 {wait_time} 秒后重试...")
                         await asyncio.sleep(wait_time)
                     else:
-                        # 最后一次尝试也失败
                         logger.error(f"取消订单 {order_id} 失败，已达到最大重试次数: {e}")
                         raise
             
@@ -318,6 +312,9 @@ class MartingaleBot:
             # 调整精度
             buy_amount_base = round(buy_amount_base, self.pair_accuracy)
             
+            # 使用通用方法处理数量精度，避免"Quantity decimal too long"错误
+            buy_amount_base = self.get_valid_quantity(buy_amount_base, 2, 0)
+            
             # 计算实际消耗的quote资产（按照计划价格）
             planned_quote_amount = round(planned_buy_price * buy_amount_base, 2)
             
@@ -391,7 +388,6 @@ class MartingaleBot:
                     self.last_planned_buy_price = planned_buy_price
                     
                     return True
-                    
                 except Exception as e:
                     if "Insufficient" in str(e):
                         logger.error(f"买单失败-资金不足: {e}")
@@ -436,6 +432,10 @@ class MartingaleBot:
             
             logger.info(f"卖单计算: 总成本均价={self.avg_buy_price}, 目标卖出价格={target_sell_price}, 当前市场价格={current_market_price}")
             
+            # 处理订单数量精度问题 - 修复"Quantity decimal too long"错误
+            # 使用通用方法处理数量精度
+            sell_quantity = self.get_valid_quantity(self.total_base_bought, 2, 0)
+            
             # 检查卖单价格是否低于当前市场价
             if target_sell_price < current_market_price:
                 logger.info(f"目标卖出价格 {target_sell_price} 低于当前市场价格 {current_market_price}，将使用市价单卖出")
@@ -446,7 +446,7 @@ class MartingaleBot:
                         symbol=self.symbol,
                         side="Ask",
                         orderType="Market",
-                        quantity=str(self.total_base_bought),
+                        quantity=str(sell_quantity),  # 使用舍入后的数量
                         timeInForce="IOC"  # 立即成交或取消
                     )
                     
@@ -456,14 +456,47 @@ class MartingaleBot:
                     self.active_sell_order = {
                         "id": order["id"],
                         "price": current_market_price,  # 使用当前市场价格作为预估价格
-                        "quantity": self.total_base_bought,
+                        "quantity": sell_quantity,  # 使用舍入后的数量
                         "is_market": True,
                         "created_at": datetime.now().timestamp()
                     }
                     
                     return True
                 except Exception as e:
-                    logger.error(f"市价卖单失败: {e}")
+                    error_message = str(e)
+                    logger.error(f"市价卖单失败: {error_message}")
+                    
+                    # 如果是精度错误，尝试降低精度
+                    if "decimal too long" in error_message.lower() or "INVALID_CLIENT_REQUEST" in error_message:
+                        logger.info(f"尝试降低数量精度并重试")
+                        for precision in range(2, -1, -1):  # 尝试使用2,1,0位小数精度
+                            try:
+                                sell_quantity = round(self.total_base_bought, precision)
+                                logger.info(f"调整订单数量精度至{precision}位小数: {sell_quantity}")
+                                
+                                order = self.bpx.ExeOrder(
+                                    symbol=self.symbol,
+                                    side="Ask",
+                                    orderType="Market",
+                                    quantity=str(sell_quantity),
+                                    timeInForce="IOC"
+                                )
+                                
+                                logger.info(f"市价卖单已下单(调整精度后): {order}")
+                                
+                                self.active_sell_order = {
+                                    "id": order["id"],
+                                    "price": current_market_price,
+                                    "quantity": sell_quantity,
+                                    "is_market": True,
+                                    "created_at": datetime.now().timestamp()
+                                }
+                                
+                                return True
+                            except Exception as e2:
+                                error_message2 = str(e2)
+                                logger.warning(f"精度{precision}尝试失败: {error_message2}")
+                                continue
                     
                     # 如果市价单失败，尝试限价单 (价格设为市场价)
                     logger.info(f"尝试使用限价单 (市场价) 卖出")
@@ -473,13 +506,13 @@ class MartingaleBot:
             max_retries = 3
             for attempt in range(max_retries):
                 try:
-                    logger.info(f"正在下限价卖单: 价格={target_sell_price}, 数量={self.total_base_bought} {self.base_currency}")
+                    logger.info(f"正在下限价卖单: 价格={target_sell_price}, 数量={sell_quantity} {self.base_currency}")
                     
                     order = self.bpx.ExeOrder(
                         symbol=self.symbol,
                         side="Ask",
                         orderType="Limit",
-                        quantity=str(self.total_base_bought),
+                        quantity=str(sell_quantity),  # 使用舍入后的数量
                         price=str(target_sell_price),
                         timeInForce="GTC"
                     )
@@ -500,8 +533,21 @@ class MartingaleBot:
                 except Exception as e:
                     error_message = str(e)
                     
+                    # 处理精度错误
+                    if "decimal too long" in error_message.lower() or "INVALID_CLIENT_REQUEST" in error_message:
+                        if "Quantity decimal too long" in error_message:
+                            logger.warning(f"订单数量精度错误: {error_message}")
+                            
+                            # 使用更低精度重试
+                            sell_quantity = self.get_valid_quantity(self.total_base_bought, 1, 0)  # 降低起始精度至1
+                            logger.info(f"降低数量精度: {sell_quantity}")
+                            continue
+                        else:
+                            logger.error(f"请求无效: {error_message}")
+                            return False
+                    
                     # 处理"即时成交"错误
-                    if "would immediately match" in error_message.lower():
+                    elif "would immediately match" in error_message.lower():
                         logger.warning(f"卖单会即时成交: {error_message}")
                         
                         # 调整卖单价格到市场价格上方1%
@@ -574,7 +620,7 @@ class MartingaleBot:
                 # 尝试使用交易历史查询，如果存在该方法
                 if hasattr(self.bpx, 'fillsQuery'):
                     try:
-                        fills = self.bpx.fillsQuery(self.symbol, orderId=order_id)
+                        fills = self.bpx.fillsQuery(self.symbol, limit=10)
                         if fills:
                             logger.info(f"通过fillsQuery获取到订单成交历史: {fills}")
                             fill_result = self._process_order_fills(fills)
@@ -812,11 +858,11 @@ class MartingaleBot:
                     # 更新最后买入价格 - 保存实际成交价格和计划价格
                     self.last_buy_price = executed_price
                     self.last_planned_buy_price = planned_price
-                    
+                
                     # 更新平均买入价格和总持仓
                     new_base = actual_quantity
                     new_quote = actual_quote_amount
-                    
+                
                     # 更新总花费和总购买数量
                     self.total_quote_spent += new_quote
                     self.total_base_bought += new_base
@@ -832,20 +878,20 @@ class MartingaleBot:
                     else:
                         # 如果总持仓量为0，使用本次交易价格作为平均价格
                         self.avg_buy_price = executed_price
-                        logger.warning(f"总持仓为0，使用本次交易价格({executed_price})作为平均买入价格")
+                        logger.warning(f"总持仓为0，使用本次交易价格({executed_price})作为平均价格")
                     
                     # 计算下一次加仓价格 - 使用计划价格而不是实际成交价格
                     self.next_buy_price = round(planned_price * self.price_drop_factor, self.pair_accuracy)
-                    
+                
                     logger.info(f"更新后的平均买入价格: {self.avg_buy_price}, 总持仓: {self.total_base_bought} {self.base_currency}, 已用资金: {self.total_quote_spent:.2f} {self.quote_currency}")
                     logger.info(f"下一次加仓价格: {self.next_buy_price} (基于计划买入价格 {planned_price})")
-                    
+                
                     # 买单成交后，尝试放置卖单
                     self.active_buy_order = None
                     logger.info("准备放置卖单...")
                     await self.place_sell_order()
                     logger.info(f"卖单放置结果: {'成功' if self.active_sell_order else '失败，稍后重试'}")
-                # 原有的检查价格下跌逻辑可以移除，因为已经在上面处理了
+                    # 原有的检查价格下跌逻辑可以移除，因为已经在上面处理了
             
             # 买单已成交但未放置卖单，重新尝试放置卖单
             elif self.active_buy_order is None and self.active_sell_order is None and self.total_base_bought > 0:
@@ -940,7 +986,7 @@ class MartingaleBot:
                     if base_available >= self.active_sell_order["quantity"]:
                         logger.warning(f"账户中仍有足够的 {self.base_currency}，卖单可能未真正成交。将继续保持卖单状态。")
                         return
-                    
+                
                     # 计算利润
                     sell_value = self.active_sell_order["price"] * self.active_sell_order["quantity"]
                     buy_value = self.total_quote_spent
@@ -988,7 +1034,7 @@ class MartingaleBot:
                     await self.place_buy_order(current_price)
                     logger.info(f"新买单放置结果: {'成功' if self.active_buy_order else '失败'}")
                 else:
-                    # 计算当前价格距离卖出目标价格的百分比
+                    # 卖单存在但尚未成交，显示等待状态
                     price_gap_to_target = round((self.active_sell_order['price'] - current_price) / current_price * 100, 2)
                     time_waiting = datetime.now() - datetime.fromtimestamp(self.active_sell_order.get('created_at', datetime.now().timestamp()))
                     minutes_waiting = round(time_waiting.total_seconds() / 60, 1)
@@ -1164,6 +1210,49 @@ class MartingaleBot:
         except Exception as e:
             logger.error(f"获取活跃订单失败: {e}")
             return []
+
+    def get_valid_quantity(self, quantity, start_precision=2, min_precision=0):
+        """获取有效的订单数量精度
+        
+        Args:
+            quantity: 原始数量
+            start_precision: 起始精度
+            min_precision: 最小可接受精度
+            
+        Returns:
+            有效精度的数量
+        """
+        for precision in range(start_precision, min_precision - 1, -1):
+            valid_quantity = round(quantity, precision)
+            if valid_quantity > 0:  # 确保数量大于0
+                return valid_quantity
+                
+        # 如果所有精度都尝试过仍然失败
+        logger.error(f"无法找到合适的数量精度，原始数量: {quantity}")
+        return round(quantity, min_precision)  # 返回最小精度结果
+
+    async def initialize(self):
+        """初始化配置"""
+        try:
+            base_accuracy = 2  # SOL的精度为2位小数
+            quote_accuracy = 2  # USDC的精度为2位小数
+            
+            # 设置交易对精度 
+            self.pair_accuracy = base_accuracy
+            
+            logger.info(f"初始化交易对精度: {self.base_currency}精度为{base_accuracy}位, {self.quote_currency}精度为{quote_accuracy}位")
+            
+            # 获取账户余额
+            await self.get_account_balance()
+            
+            # 获取程序启动时的当前价格
+            current_price = await self.get_market_price()
+            
+            # 其他初始化操作...
+            return True
+        except Exception as e:
+            logger.error(f"初始化失败: {e}", exc_info=True)
+            return False
 
 
 def signal_handler(sig, frame):
