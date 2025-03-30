@@ -128,7 +128,11 @@ class MartingaleBot:
         self.last_planned_buy_price = 0  # 新增：记录最后一次买入的计划价格
 
         self.history_file = f"trade_history_{symbol}.json"
+        self.state_file = f"bot_state_{symbol}.json"  # 新增：状态文件路径
         self.load_trade_history()
+        
+        # 尝试加载之前的状态
+        self.load_state()
 
         logger.info(
             f"马丁格尔交易机器人初始化完成: {symbol}, 初始投资: {initial_investment}, 最大级别: {max_level}, 倍数: {multiplier}, 总投资: {total_investment}, 最小订单量: {min_order_quantity}, 价格下跌阈值: {price_drop_threshold}%"
@@ -162,6 +166,74 @@ class MartingaleBot:
                 json.dump(data, f, indent=2)
         except Exception as e:
             logger.error(f"保存交易历史失败: {e}")
+
+    def save_state(self):
+        """保存当前状态到文件，以便重启后恢复"""
+        try:
+            state = {
+                "current_level": self.current_level,
+                "avg_buy_price": self.avg_buy_price,
+                "total_base_bought": self.total_base_bought,
+                "total_quote_spent": self.total_quote_spent,
+                "active_buy_order": self.active_buy_order,
+                "active_sell_order": self.active_sell_order,
+                "last_buy_price": self.last_buy_price,
+                "next_buy_price": self.next_buy_price,
+                "last_planned_buy_price": self.last_planned_buy_price,
+                "updated_at": datetime.now().isoformat()
+            }
+            with open(self.state_file, "w") as f:
+                json.dump(state, f, indent=2)
+            logger.info("已保存机器人状态")
+        except Exception as e:
+            logger.error(f"保存机器人状态失败: {e}")
+    
+    def load_state(self):
+        """从文件加载之前保存的状态"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, "r") as f:
+                    state = json.load(f)
+                
+                # 恢复基本状态数据
+                self.current_level = state.get("current_level", 0)
+                self.avg_buy_price = state.get("avg_buy_price", 0)
+                self.total_base_bought = state.get("total_base_bought", 0)
+                self.total_quote_spent = state.get("total_quote_spent", 0)
+                self.last_buy_price = state.get("last_buy_price", 0)
+                self.next_buy_price = state.get("next_buy_price", 0)
+                self.last_planned_buy_price = state.get("last_planned_buy_price", 0)
+                
+                # 恢复订单信息
+                self.active_buy_order = state.get("active_buy_order")
+                self.active_sell_order = state.get("active_sell_order")
+                
+                # 计算状态更新时间距离现在的时间
+                updated_at = state.get("updated_at")
+                if updated_at:
+                    updated_time = datetime.fromisoformat(updated_at)
+                    now = datetime.now()
+                    time_diff = (now - updated_time).total_seconds()
+                    logger.info(f"加载状态成功，状态更新时间: {updated_at}，距离现在: {time_diff/60:.1f}分钟")
+                
+                # 验证状态合法性
+                if self.total_base_bought > 0 and self.avg_buy_price > 0:
+                    if self.active_sell_order:
+                        logger.info(f"恢复状态: 马丁格尔级别 {self.current_level}, 已持仓 {self.total_base_bought} {self.base_currency}, 平均成本 {self.avg_buy_price}, 当前有卖单")
+                    elif self.active_buy_order:
+                        logger.info(f"恢复状态: 马丁格尔级别 {self.current_level}, 已持仓 {self.total_base_bought} {self.base_currency}, 平均成本 {self.avg_buy_price}, 当前有买单")
+                    else:
+                        logger.info(f"恢复状态: 马丁格尔级别 {self.current_level}, 已持仓 {self.total_base_bought} {self.base_currency}, 平均成本 {self.avg_buy_price}, 无活跃订单")
+                else:
+                    logger.info("恢复状态: 无活跃持仓或订单")
+                
+                return True
+            else:
+                logger.info("未找到状态文件，将从新周期开始")
+                return False
+        except Exception as e:
+            logger.error(f"加载状态失败: {e}")
+            return False
 
     @retry_on_network_error(max_retries=5, backoff_factor=1.5)
     async def get_market_price(self) -> float:
@@ -197,7 +269,8 @@ class MartingaleBot:
             
             for attempt in range(max_retries):
                 try:
-                    response = await self.bpx.orderCancel(self.symbol, order_id)
+                    # 修复：orderCancel返回的是字典而不是协程，不能使用await
+                    response = self.bpx.orderCancel(self.symbol, order_id)
                     if response:
                         logger.info(f"订单 {order_id} 取消成功: {response}")
                         return True
@@ -237,22 +310,15 @@ class MartingaleBot:
                         logger.info("没有活跃订单需要取消")
                         return True
                     
-                    # 尝试通过API批量取消所有订单
-                    try:
-                        response = self.bpx.orderCancelAll(self.symbol)
-                        logger.info(f"批量取消订单成功: {response}")
-                        return True
-                    except Exception as batch_e:
-                        logger.warning(f"批量取消订单失败，将逐个取消: {batch_e}")
-                        
-                        # 如果批量取消失败，逐个取消订单
-                        success = True
-                        for order in active_orders:
-                            order_id = order["id"]
-                            if not await self.cancel_order(order_id):
-                                success = False
-                        
-                        return success
+                    # 修复：移除对不存在的orderCancelAll方法的调用，直接逐个取消订单
+                    logger.info(f"逐个取消 {len(active_orders)} 个活跃订单")
+                    success = True
+                    for order in active_orders:
+                        order_id = order["id"]
+                        if not await self.cancel_order(order_id):
+                            success = False
+                    
+                    return success
                     
                 except Exception as e:
                     if attempt < max_retries - 1:  # 如果不是最后一次尝试
@@ -789,9 +855,14 @@ class MartingaleBot:
                             
                             # 取消卖单
                             if original_sell_order:
-                                await self.cancel_order(original_sell_order["id"])
-                                logger.info(f"已取消原有卖单: {original_sell_order['id']}")
-                                self.active_sell_order = None
+                                # 修复：不使用await调用cancel_order方法
+                                try:
+                                    cancel_result = self.bpx.orderCancel(self.symbol, original_sell_order["id"])
+                                    logger.info(f"已取消原有卖单: {original_sell_order['id']}, 结果: {cancel_result}")
+                                    self.active_sell_order = None
+                                except Exception as cancel_e:
+                                    logger.error(f"取消原有卖单失败: {cancel_e}")
+                                    # 继续执行，因为买单已经下了
                             
                             # 等待买单成交
                             logger.info("等待加仓买单成交...")
@@ -1097,24 +1168,114 @@ class MartingaleBot:
                             f"已调整初始投资额为: {self.initial_investment:.2f} {self.quote_currency}"
                         )
 
-            # 取消所有现有订单，确保干净开始
-            await self.cancel_all_orders()
-            
             # 获取当前市场价格
             current_price = await self.get_market_price()
             logger.info(f"当前市场价格: {current_price}")
             
-            # 第一轮使用当前价格初始化计划价格和下次加仓价格
-            self.last_planned_buy_price = current_price  # 使用当前价格作为初始计划价格
-            self.next_buy_price = round(current_price * self.price_drop_factor, self.pair_accuracy)
-            logger.info(f"初始化下一次加仓价格: {self.next_buy_price}（基于当前价格: {current_price}）")
+            # 初始化initialize方法
+            await self.initialize()
             
-            # 开始第一级买入
-            await self.place_buy_order(current_price)
+            # 第一轮使用当前价格初始化计划价格和下次加仓价格
+            if self.last_planned_buy_price == 0:
+                self.last_planned_buy_price = current_price  # 使用当前价格作为初始计划价格
+            
+            if self.next_buy_price == 0:
+                self.next_buy_price = round(current_price * self.price_drop_factor, self.pair_accuracy)
+                logger.info(f"初始化下一次加仓价格: {self.next_buy_price}（基于当前价格: {current_price}）")
+            
+            # 检查是否有已保存的状态需要恢复
+            # 注意：这里不需要再调用self.load_state()，因为在__init__中已经调用过了
+            has_active_cycle = False
+            
+            # 验证当前的活跃订单和持仓状态
+            active_orders = await self.get_active_orders()
+            current_order_ids = [order.get("id") for order in active_orders if order.get("id")]
+            
+            # 检查之前保存的活跃买单是否仍然存在
+            if self.active_buy_order and self.active_buy_order.get("id"):
+                if self.active_buy_order["id"] in current_order_ids:
+                    logger.info(f"发现活跃买单: ID={self.active_buy_order['id']}, 价格={self.active_buy_order['price']}")
+                    has_active_cycle = True
+                else:
+                    # 买单不在活跃列表中，可能已成交或被取消，检查实际状态
+                    order_details = await self.get_order_details(self.active_buy_order["id"], self.active_buy_order)
+                    if order_details and order_details.get("status") == "Filled":
+                        logger.info(f"买单已成交但未记录: ID={self.active_buy_order['id']}")
+                        # 这里可以模拟买单成交处理，但最好在下面的check_order_status中处理
+                        has_active_cycle = True
+                    else:
+                        logger.info(f"保存的买单不再活跃也未成交，将忽略该买单")
+                        self.active_buy_order = None
+            
+            # 检查之前保存的活跃卖单是否仍然存在
+            if self.active_sell_order and self.active_sell_order.get("id"):
+                if self.active_sell_order["id"] in current_order_ids:
+                    logger.info(f"发现活跃卖单: ID={self.active_sell_order['id']}, 价格={self.active_sell_order['price']}")
+                    has_active_cycle = True
+                else:
+                    # 卖单不在活跃列表中，可能已成交或被取消，检查实际状态
+                    try:
+                        order_status = self.bpx.orderQuery(self.symbol, self.active_sell_order["id"])
+                        if order_status and order_status.get("status") == "Filled":
+                            logger.info(f"卖单已成交但未记录: ID={self.active_sell_order['id']}")
+                            # 这里可以模拟卖单成交处理，但最好在下面的check_order_status中处理
+                            has_active_cycle = True
+                        else:
+                            logger.info(f"保存的卖单不再活跃也未成交，将忽略该卖单")
+                            self.active_sell_order = None
+                    except Exception as e:
+                        logger.error(f"查询卖单状态失败: {e}")
+                        self.active_sell_order = None
+            
+            # 如果有持仓但无活跃卖单，也视为有活跃周期
+            if self.total_base_bought > 0 and self.avg_buy_price > 0 and not self.active_sell_order:
+                base_available, _ = await self.get_account_balance()
+                if base_available >= self.total_base_bought * 0.9:  # 考虑到可能有小数点精度问题，使用90%作为验证标准
+                    logger.info(f"发现未完成周期: 持有 {self.total_base_bought} {self.base_currency}, 平均成本 {self.avg_buy_price}, 无活跃卖单")
+                    has_active_cycle = True
+                else:
+                    logger.warning(f"保存的持仓数据与实际不符，将重置状态")
+                    self.total_base_bought = 0
+                    self.total_quote_spent = 0
+                    self.avg_buy_price = 0
+            
+            # 根据状态恢复结果决定下一步操作
+            if has_active_cycle:
+                logger.info("检测到未完成的交易周期，将继续执行")
+                
+                # 如果有买单但无卖单，并且持仓不为零，尝试放置卖单
+                if self.active_buy_order is None and self.active_sell_order is None and self.total_base_bought > 0:
+                    logger.info("检测到有持仓但无活跃卖单，尝试放置卖单")
+                    await self.place_sell_order()
+                
+                # 不初始化新的买单，直接进入主循环检查状态
+            else:
+                logger.info("未检测到活跃周期，将取消所有现有订单并开始新周期")
+                
+                # 取消所有订单，确保干净开始
+                await self.cancel_all_orders()
+                
+                # 重置状态
+                self.current_level = 0
+                self.total_base_bought = 0
+                self.total_quote_spent = 0
+                self.avg_buy_price = 0
+                self.active_buy_order = None
+                self.active_sell_order = None
+                
+                # 开始第一级买入
+                await self.place_buy_order(current_price)
+            
+            # 保存初始状态
+            self.save_state()
 
             # 主循环，监控订单状态并根据需要调整
             while running:
+                # 检查订单状态
                 await self.check_order_status()
+                
+                # 保存状态，以便下次重启可以恢复
+                self.save_state()
                 
                 # 如果买单未成交，检查是否需要取消并以更低价格重新买入（马丁格尔策略逻辑）
                 if self.active_buy_order and not self.active_sell_order:
@@ -1147,6 +1308,9 @@ class MartingaleBot:
                         
                         # 重新放置买单
                         await self.place_buy_order(current_price)
+                        
+                        # 保存更新后的状态
+                        self.save_state()
                 
                 # 检查卖单状态
                 if self.active_sell_order:
@@ -1158,15 +1322,18 @@ class MartingaleBot:
                         logger.info(f"市场价格上涨较多，调整卖单价格")
                         
                         try:
-                            # 取消现有卖单
-                            self.bpx.orderCancel(self.symbol, self.active_sell_order["id"])
-                            logger.info(f"取消卖单: {self.active_sell_order['id']}")
+                            # 取消现有卖单，不使用await
+                            cancel_result = self.bpx.orderCancel(self.symbol, self.active_sell_order["id"])
+                            logger.info(f"取消卖单结果: {cancel_result}")
                             self.active_sell_order = None
                             
                             # 重新放置卖单，价格更高
                             await self.place_sell_order()
+                            
+                            # 保存更新后的状态
+                            self.save_state()
                         except Exception as e:
-                            logger.error(f"调整卖单失败: {e}")
+                            logger.error(f"调整卖单失败: {e}", exc_info=True)
                 
                 # 睡眠一段时间再检查
                 await asyncio.sleep(3)  # 从30秒减少到3秒，更快速地响应市场变化
